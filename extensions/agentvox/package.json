@@ -1,0 +1,18 @@
+{
+  "name": "@openclaw/plugin-agentvox",
+  "version": "0.0.1",
+  "private": true,
+  "description": "AgentVox integration — act as a third-party AgentVox agent",
+  "type": "module",
+  "main": "index.ts",
+  "dependencies": {
+    "qrcode-terminal": "^0.12.0",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/ws": "^8.5.13"
+  },
+  "peerDependencies": {
+    "openclaw": "*"
+  }
+}

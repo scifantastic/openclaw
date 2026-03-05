@@ -1,0 +1,15 @@
+{
+  "id": "agentvox",
+  "channels": [],
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "enabled": { "type": "boolean" },
+      "hubUrl": { "type": "string" },
+      "sessionKey": { "type": "string" },
+      "agentId": { "type": "string" },
+      "deviceName": { "type": "string" }
+    }
+  }
+}

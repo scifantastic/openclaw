@@ -8,6 +8,7 @@ import {
 } from "@mariozechner/pi-coding-agent";
 import { resolveHeartbeatPrompt } from "../../../auto-reply/heartbeat.js";
 import { resolveChannelCapabilities } from "../../../config/channel-capabilities.js";
+import { emitAgentEvent } from "../../../infra/agent-events.js";
 import { getMachineDisplayName } from "../../../infra/machine-name.js";
 import {
   ensureGlobalUndiciEnvProxyDispatcher,
@@ -1957,6 +1958,25 @@ export async function runEmbeddedAttempt(
         }
         if (params.replyOperation) {
           params.replyOperation.detachBackend(queueHandle);
+        }
+        // When the run was aborted, the SDK never emits `agent_end`, so the
+        // subscription handler `handleAgentEnd` never fires and no lifecycle
+        // end event is published.  Emit one here so that listeners (web UI,
+        // extensions) can stop their "responding" indicators.
+        if (aborted) {
+          emitAgentEvent({
+            runId: params.runId,
+            stream: "lifecycle",
+            data: {
+              phase: "end",
+              endedAt: Date.now(),
+              aborted: true,
+            },
+          });
+          void params.onAgentEvent?.({
+            stream: "lifecycle",
+            data: { phase: "end", aborted: true },
+          });
         }
         clearActiveEmbeddedRun(params.sessionId, queueHandle, params.sessionKey);
         params.abortSignal?.removeEventListener?.("abort", onAbort);
