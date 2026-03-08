@@ -31,6 +31,7 @@ import {
   resolveSessionInfo,
   resolveTargetSessionKey,
 } from "./session-bridge.js";
+import { stripInboundMetadata, stripSystemLines } from "./strip-inbound-meta.js";
 import { buildMessage, type AgentVoxWsClient } from "./ws-client.js";
 
 export type Logger = {
@@ -220,7 +221,15 @@ async function handleMessage(ctx: HandlerContext, msg: AgentVoxMessage) {
   ctx.logger.info(
     `[agentvox] Received message: "${payload.message.slice(0, 80)}..." → session ${sessionKey}`,
   );
-  ctx.logger.info(`[agentvox] Full payload: ${JSON.stringify(payload)}`);
+  // Log payload summary (omit large base64 data from media attachments)
+  const payloadSummary = { ...payload };
+  if (payloadSummary.mediaAttachments) {
+    payloadSummary.mediaAttachments = (payloadSummary.mediaAttachments as any[]).map((a: any) => ({
+      ...a,
+      data: `[${a.data?.length ?? 0} chars base64]`,
+    }));
+  }
+  ctx.logger.info(`[agentvox] Full payload: ${JSON.stringify(payloadSummary)}`);
 
   // Send an error event when the handler fails before the streaming bridge starts.
   // Uses session_update lifecycle:error so the iOS app shows it inline.
@@ -243,54 +252,60 @@ async function handleMessage(ctx: HandlerContext, msg: AgentVoxMessage) {
     );
   };
 
+  // Track saved media files for cleanup in finally block
+  const mediaPaths: string[] = [];
+
   try {
     const cfg = ctx.runtime.config.loadConfig();
 
-    // Build message content: text + images (if any)
-    let messageContent: string | Array<{ type: string; text?: string; source?: any }> =
-      payload.message;
+    // Save media attachments to temp files so OpenClaw's native image pipeline can pick them up.
+    // OpenClaw expects MediaPaths/MediaTypes on the context (like Telegram/Discord),
+    // NOT structured content blocks in BodyForAgent (which must be a string).
+    const mediaTypes: string[] = [];
 
     if (payload.mediaAttachments && payload.mediaAttachments.length > 0) {
       ctx.logger.info(
         `[agentvox] Processing ${payload.mediaAttachments.length} media attachment(s)`,
       );
 
-      // Build content blocks array with text + images
-      const contentBlocks: Array<{ type: string; text?: string; source?: any }> = [];
+      // Create a temp directory for media files
+      const mediaDir = path.join(process.env.HOME || "/tmp", ".openclaw", "media", "agentvox");
+      fs.mkdirSync(mediaDir, { recursive: true });
 
-      // Add text block first (if not empty)
-      if (payload.message && payload.message.trim()) {
-        contentBlocks.push({
-          type: "text",
-          text: payload.message,
-        });
-      }
-
-      // Add image blocks
       for (const attachment of payload.mediaAttachments) {
-        contentBlocks.push({
-          type: "image",
-          source: {
-            type: "base64",
-            media_type: attachment.mimeType,
-            data: attachment.data,
-          },
-        });
+        // Determine file extension from mime type
+        const extMap: Record<string, string> = {
+          "image/jpeg": ".jpg",
+          "image/png": ".png",
+          "image/gif": ".gif",
+          "image/webp": ".webp",
+          "image/heic": ".heic",
+          "image/heif": ".heif",
+        };
+        const ext = extMap[attachment.mimeType] || ".jpg";
+        const fileName = `agentvox-${randomUUID()}${ext}`;
+        const filePath = path.join(mediaDir, fileName);
+
+        // Write base64 data to file
+        fs.writeFileSync(filePath, Buffer.from(attachment.data, "base64"));
+        mediaPaths.push(filePath);
+        mediaTypes.push(attachment.mimeType);
+
         ctx.logger.info(
-          `[agentvox] Added image: ${attachment.mimeType}, ${attachment.data.length} chars`,
+          `[agentvox] Saved image: ${attachment.mimeType}, ${attachment.data.length} base64 chars → ${filePath}`,
         );
       }
-
-      messageContent = contentBlocks;
     }
 
+    const messageText = payload.message;
+
     // Build inbound message context (like Telegram does)
-    const inboundCtx = {
-      Body: typeof messageContent === "string" ? messageContent : JSON.stringify(messageContent),
-      BodyForAgent: messageContent, // Pass structured content for agent
-      BodyForCommands: payload.message, // Commands only parse text
-      RawBody: payload.message,
-      CommandBody: payload.message,
+    const inboundCtx: Record<string, unknown> = {
+      Body: messageText,
+      BodyForAgent: messageText,
+      BodyForCommands: messageText,
+      RawBody: messageText,
+      CommandBody: messageText,
       SessionKey: sessionKey,
       Provider: "agentvox",
       Surface: "agentvox",
@@ -300,8 +315,18 @@ async function handleMessage(ctx: HandlerContext, msg: AgentVoxMessage) {
       MessageSid: payload.messageId,
     };
 
+    // Set media fields so OpenClaw's native image pipeline processes them
+    if (mediaPaths.length > 0) {
+      inboundCtx.MediaPath = mediaPaths[0];
+      inboundCtx.MediaType = mediaTypes[0];
+      inboundCtx.MediaUrl = mediaPaths[0];
+      inboundCtx.MediaPaths = mediaPaths;
+      inboundCtx.MediaUrls = mediaPaths;
+      inboundCtx.MediaTypes = mediaTypes;
+    }
+
     ctx.logger.info(
-      `[agentvox] Built context with Body="${typeof messageContent === "string" ? messageContent.slice(0, 80) : "[content blocks]"}"`,
+      `[agentvox] Built context with Body="${messageText.slice(0, 80)}"${mediaPaths.length > 0 ? `, ${mediaPaths.length} media file(s)` : ""}`,
     );
 
     // Record inbound session (creates/updates session metadata)
@@ -389,6 +414,15 @@ async function handleMessage(ctx: HandlerContext, msg: AgentVoxMessage) {
     ctx.logger.error(`[agentvox] Failed to process message: ${errorMsg}`);
     ctx.logger.error(`[agentvox] Stack: ${err instanceof Error ? err.stack : "n/a"}`);
     sendErrorEvent("Sorry, I encountered an error processing your message.");
+  } finally {
+    // Clean up temp media files (best-effort, don't block on errors)
+    for (const mediaPath of mediaPaths) {
+      try {
+        fs.unlinkSync(mediaPath);
+      } catch {
+        // ignore — file may have already been moved/deleted
+      }
+    }
   }
 }
 
@@ -443,7 +477,26 @@ function handleGetSessionContext(ctx: HandlerContext, msg: AgentVoxMessage) {
       } else {
         content = "";
       }
-      return { role: m.role, content };
+      // Strip OpenClaw-injected metadata blocks from user messages —
+      // they're AI-facing only and shouldn't appear in the iOS app.
+      let systemEvents: string[] | undefined;
+      if (m.role === "user" && typeof content === "string") {
+        content = stripInboundMetadata(content);
+        // Extract System: lines and pass them as a separate attribute
+        const stripped = stripSystemLines(content);
+        content = stripped.content;
+        if (stripped.systemEvents.length > 0) {
+          systemEvents = stripped.systemEvents;
+        }
+      }
+      // Pass timestamp (ms epoch) so clients can display correct message times
+      const timestamp = typeof m.timestamp === "number" ? m.timestamp : undefined;
+      return {
+        role: m.role,
+        content,
+        ...(timestamp ? { timestamp } : {}),
+        ...(systemEvents ? { systemEvents } : {}),
+      };
     });
 
     // Build system prompt from workspace files in the session's systemPromptReport
