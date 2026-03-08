@@ -18,6 +18,7 @@ import path from "node:path";
 import type { AgentVoxConfig } from "./config.js";
 import { MSG } from "./protocol.js";
 import { resolveSessionInfo, resolveSessionIdFromKey } from "./session-bridge.js";
+import { stripInboundMetadata, stripSystemLines } from "./strip-inbound-meta.js";
 import { buildMessage, type AgentVoxWsClient } from "./ws-client.js";
 
 export type StreamingBridgeLogger = {
@@ -228,8 +229,24 @@ export function createStreamingBridge(opts: StreamingBridgeOptions): StreamingBr
     msg: { role: string; content: unknown; transcriptId?: string; [key: string]: unknown },
     sessionKey: string,
   ) {
-    const textContent = extractTextContent(msg.content);
+    let textContent = extractTextContent(msg.content);
     if (!textContent.trim()) return;
+
+    // Strip OpenClaw-injected metadata blocks from user messages before
+    // forwarding to the iOS app — they're AI-facing only.
+    let systemEvents: string[] | undefined;
+    if (msg.role === "user") {
+      textContent = stripInboundMetadata(textContent);
+      if (!textContent.trim()) return;
+      // Extract System: lines (node events, model switches, etc.) and pass
+      // them as a separate attribute so clients can display them distinctly.
+      const stripped = stripSystemLines(textContent);
+      textContent = stripped.content;
+      if (stripped.systemEvents.length > 0) {
+        systemEvents = stripped.systemEvents;
+      }
+      if (!textContent.trim()) return;
+    }
 
     const contentBlocks = Array.isArray(msg.content) ? msg.content : undefined;
     const toolCalls = Array.isArray(msg.toolCalls) ? msg.toolCalls : undefined;
@@ -256,6 +273,7 @@ export function createStreamingBridge(opts: StreamingBridgeOptions): StreamingBr
         thinking,
         model,
         usage,
+        systemEvents,
       },
     });
   }
@@ -402,7 +420,45 @@ export function createStreamingBridge(opts: StreamingBridgeOptions): StreamingBr
     }
   }
 
+  /** Initialize transcript offsets for all known session files so the first
+   *  onSessionTranscriptUpdate event only picks up NEW messages. */
+  function initTranscriptOffsets() {
+    const openclawDir = path.join(process.env.HOME || "~", ".openclaw");
+    const agentsDir = path.join(openclawDir, "agents");
+    if (!fs.existsSync(agentsDir)) return;
+
+    try {
+      const agents = fs.readdirSync(agentsDir, { withFileTypes: true });
+      for (const agent of agents) {
+        if (!agent.isDirectory()) continue;
+        const sessionsDir = path.join(agentsDir, agent.name, "sessions");
+        if (!fs.existsSync(sessionsDir)) continue;
+        try {
+          const files = fs.readdirSync(sessionsDir);
+          for (const file of files) {
+            if (!file.endsWith(".jsonl")) continue;
+            const filePath = path.join(sessionsDir, file);
+            const offset = initOffset(filePath);
+            transcriptOffsets.set(filePath, offset);
+          }
+        } catch {
+          // skip unreadable dirs
+        }
+      }
+    } catch {
+      // agents dir not scannable — offsets will be initialized on first event
+    }
+    logger.info(
+      `[agentvox] Initialized transcript offsets for ${transcriptOffsets.size} session file(s)`,
+    );
+  }
+
   function startEventHooks() {
+    // Initialize transcript file offsets BEFORE subscribing to events.
+    // This ensures the first event only picks up messages written AFTER
+    // the bridge starts, not the entire history.
+    initTranscriptOffsets();
+
     // Subscribe to agent events
     if (events?.onAgentEvent) {
       try {
@@ -413,7 +469,12 @@ export function createStreamingBridge(opts: StreamingBridgeOptions): StreamingBr
       }
     }
 
-    // Subscribe to transcript updates
+    // Subscribe to transcript updates.
+    // Uses offset-based reading (like the file watcher mode) to reliably
+    // pick up ALL new messages since the last read. The previous approach
+    // of reading the last line of the file was racy — by the time we read,
+    // the agent may have written additional lines, causing user messages
+    // to be skipped.
     if (events?.onSessionTranscriptUpdate) {
       try {
         unsubTranscript = events.onSessionTranscriptUpdate(
@@ -426,20 +487,17 @@ export function createStreamingBridge(opts: StreamingBridgeOptions): StreamingBr
             const extractedSessionId = sessionIdMatch?.[1] || "main";
             const sessionKey = `agent:${agentId}:${extractedSessionId}`;
 
-            // Read last message from the file
-            try {
-              const lines = fs.readFileSync(update.sessionFile, "utf-8").trim().split("\n");
-              if (lines.length > 0) {
-                const parsed = JSON.parse(lines[lines.length - 1]);
-                if (parsed.type === "message" && parsed.message) {
-                  forwardTranscriptMessage(
-                    { ...parsed.message, transcriptId: parsed.id },
-                    sessionKey,
-                  );
-                }
-              }
-            } catch (err) {
-              logger.warn(`[agentvox] Failed to read transcript ${update.sessionFile}: ${err}`);
+            // If this is a file we haven't seen before (new session created
+            // after bridge start), initialize offset to 0 so we read from
+            // the beginning (new files start empty, so this is correct).
+            if (!transcriptOffsets.has(update.sessionFile)) {
+              transcriptOffsets.set(update.sessionFile, 0);
+            }
+
+            // Read all new messages since last offset — no race condition.
+            const newMessages = readNewMessages(update.sessionFile);
+            for (const msg of newMessages) {
+              forwardTranscriptMessage(msg, sessionKey);
             }
           },
         );

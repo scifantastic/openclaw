@@ -145,7 +145,21 @@ export function readTranscriptMessages(transcriptPath: string): TranscriptMessag
     try {
       const parsed = JSON.parse(line);
       if (parsed?.message && typeof parsed.message === "object") {
-        messages.push(parsed.message as TranscriptMessage);
+        const msg = parsed.message as TranscriptMessage;
+        // Timestamp lives on the outer JSONL envelope, not the message itself.
+        // Convert ISO string to epoch ms for clients.
+        if (!msg.timestamp && parsed.timestamp) {
+          const ts =
+            typeof parsed.timestamp === "string"
+              ? new Date(parsed.timestamp).getTime()
+              : typeof parsed.timestamp === "number"
+                ? parsed.timestamp
+                : undefined;
+          if (ts && !isNaN(ts)) {
+            msg.timestamp = ts;
+          }
+        }
+        messages.push(msg);
       }
     } catch {
       // skip bad lines
