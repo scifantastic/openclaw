@@ -265,7 +265,20 @@ export function createAgentVoxWsClient(opts: AgentVoxWsClientOptions): AgentVoxW
 
   function connect() {
     if (stopped) return;
+
+    // Cancel any pending reconnect timer to prevent stale timers from
+    // firing after the new connection is established.
+    if (reconnectTimer) {
+      clearTimeout(reconnectTimer);
+      reconnectTimer = null;
+    }
+
+    // Remove event listeners from old socket BEFORE closing it.
+    // Without this, ws.close() fires the old socket's "close" event,
+    // which schedules another reconnect timer that later kills the
+    // new working connection.
     if (ws) {
+      ws.removeAllListeners();
       try {
         ws.close();
       } catch {
